@@ -1,0 +1,59 @@
+name: Build chat bundle
+
+# Packs the minimal Lean + Mathlib tree (see chat-skill/make_bundle.py) and
+# publishes it as release `bundle-<lean version>`, so a claude.ai chat sandbox can
+# download it and check proofs locally. Rebuilt only when the versions change.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - lean-toolchain
+      - lake-manifest.json
+      - chat-skill/make_bundle.py
+      - .github/workflows/bundle.yml
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: leanprover/lean-action@v1 # elan + Mathlib cache + lake build
+      - name: Assemble minimal tree
+        run: python3 chat-skill/make_bundle.py "$RUNNER_TEMP/lean"
+      - name: Compress and split
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          tar -C "$RUNNER_TEMP" -cf - lean \
+            | zstd -19 --long=27 -T0 -q \
+            | split -b 1900M -d -a 2 - "$RUNNER_TEMP/out/lean.tar.zst.part"
+          cd "$RUNNER_TEMP/out"
+          python3 - <<'EOF'
+          import hashlib, json, os, pathlib
+          v = pathlib.Path(os.environ["GITHUB_WORKSPACE"], "lean-toolchain").read_text().strip().split(":")[-1]
+          parts = []
+          for p in sorted(pathlib.Path(".").glob("lean.tar.zst.part*")):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              parts.append({"name": p.name, "size": p.stat().st_size, "sha256": h.hexdigest()})
+          json.dump({"lean": v, "compression": "zstd --long=27", "parts": parts},
+                    open("manifest.json", "w"), indent=2)
+          pathlib.Path(os.environ["GITHUB_ENV"]).open("a").write(f"TAG=bundle-{v}\n")
+          EOF
+          cat manifest.json
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Minimal Lean + Mathlib tree for checking proofs in a claude.ai chat sandbox (built by chat-skill/make_bundle.py)." \
+            manifest.json lean.tar.zst.part*

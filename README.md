@@ -26,31 +26,28 @@ to make that easy.
 ## Proving from a normal Claude chat (`/lean-prove`)
 
 The `lean-prove` skill (`chat-skill/lean-prove.zip`) lets a normal claude.ai chat
-write a proof and get it checked here, fully automatically:
+write a proof and machine-check it **inside the chat's own code sandbox**:
 
 ```
-chat Claude writes Proofs/<Name>.lean
-  → pushes it to branch check/<Name> (GitHub API, from Claude's code sandbox)
-  → "Verify proofs" workflow runs and comments LEAN-CHECK: PASS/FAIL on the commit
-  → Claude reads the verdict, fixes and resubmits until PASS
-  → on PASS the file is copied to main and the scratch branch is deleted
+chat Claude starts: lean_check.py setup --background
+  → streams release `bundle-v4.36.0` of this repo (~2 GB) into ~/lean
+     (a minimal Lean + Mathlib tree: just `lean` and the compiled modules that
+      `import Mathlib` loads — built by chat-skill/make_bundle.py in the
+      "Build chat bundle" workflow)
+writes <Name>.lean → lean_check.py check → fixes until LEAN-CHECK: PASS
 ```
 
-Usage: `/lean-prove <statement>` (or "prove in Lean that …").
+Usage: `/lean-prove <statement>` (or "prove in Lean that …"). No token needed: the
+sandbox only downloads (reads) from GitHub.
 
 ### One-time setup
 
-1. **Token** — https://github.com/settings/personal-access-tokens/new  
-   Fine-grained token · Repository access: *Only select repositories* → `lean-proofs` ·
-   Permissions: **Contents: Read and write**, **Actions: Read-only** · pick an expiry.
-2. **Network for Claude's sandbox** — claude.ai → Settings → Capabilities →
-   *Code execution and file creation* on, and allow network access to
-   `api.github.com` (add it as an allowed domain, or allow all domains).
-3. **Skill** — claude.ai → Settings → Capabilities → Skills → upload
+1. **Skill** — claude.ai → Settings → Capabilities → Skills → upload
    `chat-skill/lean-prove.zip`.
-4. **Project** — in the claude.ai Project where you want this, add one line to the
-   project instructions: `LEAN_GITHUB_TOKEN=github_pat_…` (the token from step 1).
-   The token can only touch this repo.
+2. **Network** — claude.ai → Settings → Capabilities → *Code execution and file
+   creation* on, with network access to `github.com`, `api.github.com`,
+   `release-assets.githubusercontent.com`, `objects.githubusercontent.com`
+   (or all domains).
 
 ## Checking locally
 

@@ -1,144 +1,273 @@
 #!/usr/bin/env python3
-"""Check a Lean 4 + Mathlib proof on GitHub Actions, from any sandbox.
+"""Check Lean 4 + Mathlib proofs inside a sandbox, with no build tools.
 
-Pushes the file to a scratch branch `check/<Name>` of the proofs repo (reset to
-`main` first), waits for the "Verify proofs" workflow to post its verdict as a
-commit comment, prints it, and on PASS also publishes the file to `main`.
+    python3 lean_check.py setup [--background]   # install ~/lean (once per sandbox)
+    python3 lean_check.py status                 # READY / progress / FAILED
+    python3 lean_check.py check File.lean ...    # strict verdict
 
-    python3 lean_check.py --token TOKEN --name SqrtTwo --file SqrtTwo.lean
-    python3 lean_check.py --wait-sha COMMIT_SHA        # only wait for a verdict
+`setup` streams a prebuilt minimal Lean + Mathlib tree (GitHub release
+`bundle-<version>` of thnastev/lean-proofs, ~2 GB download, ~8 GB unpacked)
+straight into ~/lean, verifying sha256 checksums. Only needs read access to
+github.com / api.github.com / release-assets.githubusercontent.com.
 
-Exit code: 0 = PASS, 1 = FAIL, 2 = usage/network/timeout problem.
-Only needs HTTPS access to api.github.com. Standard library only.
+`check` passes a file only if it compiles with no errors, contains no
+sorry/admit, and every declaration in it depends only on the axioms
+propext, Classical.choice, Quot.sound (asked from Lean itself, so `sorry`,
+`native_decide` and custom `axiom`s are all caught). Exit code 0 = PASS.
 """
-import argparse, base64, json, re, sys, time, urllib.error, urllib.request
+import hashlib, json, os, re, shutil, subprocess, sys, tempfile, threading, time
+import urllib.request
 
-API = "https://api.github.com"
+REPO = "thnastev/lean-proofs"
+HOME = os.environ.get("LEAN_BUNDLE_HOME", os.path.expanduser("~/lean"))
+LOG = HOME + ".setup.log"
+DONE = os.path.join(HOME, ".complete")
+STANDARD = {"propext", "Classical.choice", "Quot.sound"}
+UA = {"User-Agent": "lean-prove-skill"}
 
 
-def call(method, path, token=None, body=None):
-    req = urllib.request.Request(API + path, method=method,
-                                 data=None if body is None else json.dumps(body).encode())
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    req.add_header("User-Agent", "lean-check-skill")
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- setup
+def get(url, timeout=60):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout)
+
+
+def find_release():
+    """Newest `bundle-*` release of the repo -> (tag, manifest dict)."""
+    tag = None
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            raw = r.read()
-            return r.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+        rel = json.load(get(f"https://api.github.com/repos/{REPO}/releases?per_page=20"))
+        tags = [r["tag_name"] for r in rel if r["tag_name"].startswith("bundle-")]
+        tag = tags[0] if tags else None
+    except Exception as e:  # API blocked/rate-limited: fall back to the pinned version
+        log(f"(release list unavailable: {e}; using pinned version)")
+    tag = tag or "bundle-v4.36.0"
+    base = f"https://github.com/{REPO}/releases/download/{tag}"
+    return tag, base, json.load(get(f"{base}/manifest.json"))
+
+
+class PartsReader:
+    """File-like object: concatenation of the release parts, sha256-verified."""
+
+    def __init__(self, base, parts):
+        self.base, self.parts, self.i, self.resp, self.h = base, parts, -1, None, None
+        self.total = sum(p["size"] for p in parts)
+        self.read_bytes, self.t0, self.last = 0, time.time(), 0
+
+    def _next(self):
+        if self.resp is not None:
+            if self.h.hexdigest() != self.parts[self.i]["sha256"]:
+                raise IOError(f"checksum mismatch in {self.parts[self.i]['name']}")
+            self.resp.close()
+        self.i += 1
+        if self.i >= len(self.parts):
+            self.resp = None
+            return False
+        for attempt in range(4):
+            try:
+                self.resp = get(f"{self.base}/{self.parts[self.i]['name']}", timeout=120)
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(2 ** attempt)
+        self.h = hashlib.sha256()
+        return True
+
+    def read(self, n=1 << 20):
+        while True:
+            if self.resp is None and not self._next():
+                return b""
+            b = self.resp.read(n)
+            if b:
+                self.h.update(b)
+                self.read_bytes += len(b)
+                if time.time() - self.last > 5:
+                    self.last = time.time()
+                    mb = self.read_bytes / 1e6
+                    log(f"PROGRESS {100 * self.read_bytes / self.total:.0f}% "
+                        f"({mb:.0f}/{self.total / 1e6:.0f} MB, {mb / (time.time() - self.t0):.0f} MB/s)")
+                return b
+            self._next()
+            if self.resp is None:
+                return b""
+
+
+def setup():
+    if os.path.exists(DONE):
+        log("READY (already installed)")
+        return 0
+    tag, base, man = find_release()
+    log(f"Installing {tag}: {len(man['parts'])} part(s), "
+        f"{sum(p['size'] for p in man['parts']) / 1e9:.2f} GB download")
+    shutil.rmtree(HOME, ignore_errors=True)
+    parent = os.path.dirname(HOME)
+    staging = tempfile.mkdtemp(prefix=".lean-staging-", dir=parent)
+    src = PartsReader(base, man["parts"])
+
+    if shutil.which("zstd") and shutil.which("tar"):
+        z = subprocess.Popen(["zstd", "-dc", "--long=27"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        t = subprocess.Popen(["tar", "-x", "-C", staging], stdin=z.stdout)
+        z.stdout.close()
+        err = []
+
+        def pump():
+            try:
+                while True:
+                    b = src.read()
+                    if not b:
+                        break
+                    z.stdin.write(b)
+            except Exception as e:
+                err.append(e)
+            finally:
+                z.stdin.close()
+
+        th = threading.Thread(target=pump)
+        th.start()
+        th.join()
+        if err or z.wait() or t.wait():
+            raise SystemExit(f"FAILED: {err or 'zstd/tar error'}")
+    else:
         try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"message": raw.decode(errors="replace")}
+            import zstandard
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "zstandard"], check=True)
+            import zstandard
+        import tarfile
+        dctx = zstandard.ZstdDecompressor(max_window_size=1 << 27)
+        with dctx.stream_reader(src, read_size=1 << 20) as zr:
+            with tarfile.open(fileobj=zr, mode="r|") as tf:
+                tf.extractall(staging)
+    os.replace(os.path.join(staging, "lean"), HOME)
+    shutil.rmtree(staging, ignore_errors=True)
+    open(DONE, "w").write(tag)
+    log(f"READY ({tag}, {time.time() - src.t0:.0f}s)")
+    return 0
 
 
-def die(msg, code=2):
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(code)
+def status():
+    if os.path.exists(DONE):
+        print("READY")
+        return 0
+    if os.path.exists(LOG):
+        lines = open(LOG).read().strip().splitlines()
+        last = lines[-1] if lines else ""
+        if "FAILED" in last or "Traceback" in "".join(lines[-5:]) or "Error" in last:
+            print("FAILED\n" + "\n".join(lines[-15:]))
+            return 2
+        print("IN PROGRESS: " + last)
+        return 1
+    print("NOT STARTED (run: setup --background)")
+    return 1
 
 
-def need(status, data, what, ok=(200, 201)):
-    if status not in ok:
-        hint = ""
-        if status in (401, 403):
-            hint = (" (token missing/expired, lacks Contents: write on the repo,"
-                    " or the sandbox cannot reach api.github.com)")
-        die(f"{what} failed: HTTP {status}: {(data or {}).get('message')}{hint}")
-    return data
+# ---------------------------------------------------------------- check
+AXIOM_PROBE = r"""
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let env ← getEnv
+  for (n, _) in env.constants.map₂.toList do
+    unless n.isInternal do
+      let axs ← liftCoreM (collectAxioms n)
+      IO.println s!"@@AXIOMS {n} :: {axs.toList}"
+"""
 
 
-def put_file(repo, token, path, branch, content, message):
-    st, cur = call("GET", f"/repos/{repo}/contents/{path}?ref={branch}", token)
-    body = {"message": message, "branch": branch,
-            "content": base64.b64encode(content.encode()).decode()}
-    if st == 200:
-        if base64.b64decode(cur["content"]).decode() == content and branch == "main":
-            return None  # already identical on main
-        body["sha"] = cur["sha"]
-    st, res = call("PUT", f"/repos/{repo}/contents/{path}", token, body)
-    return need(st, res, f"writing {path} to {branch}")["commit"]["sha"]
+def strip_comments(src):
+    src = re.sub(r"/-.*?-/", " ", src, flags=re.S)
+    return re.sub(r"--[^\n]*", " ", src)
 
 
-def wait_verdict(repo, token, sha, timeout):
-    """Poll commit comments for the workflow's 'LEAN-CHECK:' verdict."""
-    deadline = time.time() + timeout
-    seen_run = False
-    while time.time() < deadline:
-        st, comments = call("GET", f"/repos/{repo}/commits/{sha}/comments", token)
-        if st == 200:
-            for c in comments:
-                if c.get("body", "").startswith("LEAN-CHECK:"):
-                    return c["body"]
-        st, runs = call("GET", f"/repos/{repo}/actions/runs?head_sha={sha}", token)
-        if st == 200 and runs.get("workflow_runs"):
-            run = runs["workflow_runs"][0]
-            if not seen_run:
-                print(f"CI run: {run['html_url']}", flush=True)
-                seen_run = True
-            if run["status"] == "completed":
-                # verdict comment is the last step; give it a moment to appear
-                time.sleep(10)
-                st, comments = call("GET", f"/repos/{repo}/commits/{sha}/comments", token)
-                for c in comments if st == 200 else []:
-                    if c.get("body", "").startswith("LEAN-CHECK:"):
-                        return c["body"]
-                return (f"LEAN-CHECK: FAIL\n\nWorkflow finished ({run['conclusion']}) without "
-                        f"posting a verdict. Log: {run['html_url']}")
-        time.sleep(15)
-    die(f"no verdict after {timeout}s for commit {sha}; check the repo's Actions tab")
+def check(files):
+    if not os.path.exists(DONE):
+        print("Lean is not installed yet: run `setup` (or check `status`).")
+        return 2
+    lean = os.path.join(HOME, "bin", "lean")
+    pk = os.path.join(HOME, "pkgs")
+    env = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/tmp"),
+           "LEAN_PATH": ":".join(os.path.join(pk, p) for p in sorted(os.listdir(pk)))}
+    all_ok = True
+    for f in files:
+        print(f"== {f}")
+        src = open(f, encoding="utf-8").read()
+        problems = []
+        code = strip_comments(src)
+        if re.search(r"(?<![\w.])(sorry|admit)(?![\w])", code):
+            problems.append("contains sorry/admit")
+        if re.search(r"^\s*(private\s+)?axiom\s", code, re.M):
+            problems.append("declares its own axiom")
+        if "skipKernelTC" in code or "debug.skip" in code:
+            problems.append("disables kernel checking")
+        d = tempfile.mkdtemp()
+        probe = os.path.join(d, os.path.basename(f))
+        open(probe, "w", encoding="utf-8").write(src.rstrip() + "\n" + AXIOM_PROBE)
+        try:
+            r = subprocess.run([lean, probe], capture_output=True, text=True, env=env,
+                               cwd=d, timeout=900)
+            out = (r.stdout + r.stderr).replace(probe, f)
+            rc = r.returncode
+        except subprocess.TimeoutExpired:
+            out, rc = "lean timed out after 900s", 1
+        shutil.rmtree(d, ignore_errors=True)
+        user_out, axioms = [], {}
+        for ln in out.splitlines():
+            m = re.match(r"@@AXIOMS (\S+) :: \[(.*)\]$", ln)
+            if m:
+                axioms[m.group(1)] = [a.strip() for a in m.group(2).split(",") if a.strip()]
+            else:
+                user_out.append(ln)
+        if rc != 0 or re.search(r":\d+:\d+: error", out):
+            problems.append("compile errors")
+        if not axioms and "compile errors" not in problems:
+            problems.append("no declarations found (or axiom probe failed)")
+        bad = {n: [a for a in ax if a not in STANDARD] for n, ax in axioms.items()}
+        bad = {n: ax for n, ax in bad.items() if ax}
+        if bad:
+            problems.append("non-standard axioms: " + "; ".join(f"{n} uses {', '.join(a)}" for n, a in bad.items()))
+        for ln in user_out:
+            if ln.strip():
+                print("  | " + ln)
+        for n, ax in sorted(axioms.items()):
+            print(f"  axioms {n}: {', '.join(ax) if ax else '(none)'}")
+        if problems:
+            all_ok = False
+            for p in problems:
+                print("  FAIL: " + p)
+        else:
+            print("  PASS: compiles, no sorry, standard axioms only")
+    print("LEAN-CHECK: " + ("PASS" if all_ok else "FAIL"))
+    return 0 if all_ok else 1
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="thnastev/lean-proofs")
-    ap.add_argument("--token", help="GitHub fine-grained token (Contents: read/write)")
-    ap.add_argument("--name", help="CamelCase module name, e.g. SqrtTwo -> Proofs/SqrtTwo.lean")
-    ap.add_argument("--file", help="local .lean file to check")
-    ap.add_argument("--no-publish", action="store_true", help="do not copy to main on PASS")
-    ap.add_argument("--wait-sha", help="only wait for the verdict of an existing commit")
-    ap.add_argument("--timeout", type=int, default=1500)
-    a = ap.parse_args()
-
-    if a.wait_sha:
-        verdict = wait_verdict(a.repo, a.token, a.wait_sha, a.timeout)
-        print(verdict)
-        sys.exit(0 if verdict.startswith("LEAN-CHECK: PASS") else 1)
-
-    if not (a.token and a.name and a.file):
-        die("--token, --name and --file are required")
-    if not re.fullmatch(r"[A-Z][A-Za-z0-9_]*", a.name):
-        die("--name must be CamelCase letters/digits, e.g. SqrtTwo")
-    content = open(a.file, encoding="utf-8").read()
-    path, branch = f"Proofs/{a.name}.lean", f"check/{a.name}"
-
-    st, ref = call("GET", f"/repos/{a.repo}/git/ref/heads/main", a.token)
-    main_sha = need(st, ref, "reading main")["object"]["sha"]
-    # Reset the scratch branch to main (create it if missing).
-    st, res = call("PATCH", f"/repos/{a.repo}/git/refs/heads/{branch}", a.token,
-                   {"sha": main_sha, "force": True})
-    if st != 200:
-        st, res = call("POST", f"/repos/{a.repo}/git/refs", a.token,
-                       {"ref": f"refs/heads/{branch}", "sha": main_sha})
-        need(st, res, f"creating branch {branch}")
-
-    sha = put_file(a.repo, a.token, path, branch, content, f"Check {path}")
-    print(f"Submitted {path} as commit {sha} on {branch}; waiting for GitHub Actions...", flush=True)
-    verdict = wait_verdict(a.repo, a.token, sha, a.timeout)
-    print(verdict)
-    passed = verdict.startswith("LEAN-CHECK: PASS")
-
-    if passed and not a.no_publish:
-        put_file(a.repo, a.token, path, "main", content, f"Add verified proof {path}")
-        call("DELETE", f"/repos/{a.repo}/git/refs/heads/{branch}", a.token)
-        print(f"\nPublished: https://github.com/{a.repo}/blob/main/{path}")
-    sys.exit(0 if passed else 1)
+    a = sys.argv[1:]
+    if not a or a[0] not in ("setup", "status", "check"):
+        print(__doc__)
+        return 2
+    if a[0] == "setup":
+        if "--background" in a:
+            if os.path.exists(DONE):
+                print("READY (already installed)")
+                return 0
+            with open(LOG, "w") as lf:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "setup"],
+                                 stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            print(f"setup started in background; poll with: python3 {sys.argv[0]} status")
+            return 0
+        try:
+            return setup()
+        except BaseException as e:
+            log(f"FAILED: {e!r}")
+            raise
+    if a[0] == "status":
+        return status()
+    return check(a[1:])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,85 +1,92 @@
 ---
 name: lean-prove
-description: Formalize a mathematical statement and its proof in Lean 4 + Mathlib, get it machine-checked on GitHub (repo thnastev/lean-proofs), and iterate until it passes. Use when the user types /lean-prove, or asks to prove, formalize, or verify something "in Lean".
+description: Formalize a mathematical statement and its proof in Lean 4 + Mathlib and machine-check it right here in the code sandbox, iterating until it passes. Use when the user types /lean-prove, or asks to prove, formalize, or verify something "in Lean".
 ---
 
-# lean-prove: write a Lean proof and get it machine-checked
+# lean-prove: write a Lean proof and machine-check it in the sandbox
 
-The user wants a **checked** proof, not just Lean code. Do the whole loop yourself,
-without asking the user to do anything, and report only when it passes (or when you
-are truly stuck).
+The user wants a **checked** proof, not just Lean code. Do the whole loop yourself
+without asking the user to do anything; report when it passes (or when truly stuck).
 
-Checker: GitHub Actions on `thnastev/lean-proofs` (Lean `v4.36.0`, Mathlib `v4.36.0`).
-A proof passes only if it compiles, has no `sorry`/`admit`, declares no `axiom`, and
-`#print axioms` shows only `propext`, `Classical.choice`, `Quot.sound`
-(so no `native_decide`).
+The checker is `scripts/lean_check.py` in this skill's folder (Python stdlib only).
+It runs a real Lean `v4.36.0` + Mathlib in the sandbox. A proof passes only if it
+compiles with no errors, has no `sorry`/`admit`, declares no `axiom`, and every
+declaration depends only on `propext`, `Classical.choice`, `Quot.sound`
+(so `native_decide` fails too).
 
-## Token
+## 0. Start the install FIRST (it runs while you think)
 
-The GitHub token is in the project instructions/knowledge (a line like
-`LEAN_GITHUB_TOKEN=github_pat_...`). Never print it, never put it in the proof
-file, never repeat it in chat. If it is missing, tell the user in one line that the
-token is not set up and point to the setup section of the repo README.
+Lean + Mathlib is ~2 GB to download and takes a few minutes, once per conversation.
+Your very first action:
 
-## Loop
+```bash
+cp -r <this skill folder>/scripts /tmp/lean-skill 2>/dev/null; python3 /tmp/lean-skill/lean_check.py setup --background
+```
 
-1. **Understand the statement.** Restate it in one line of plain math. Pick precise
-   types (`ℝ`, `ℤ`, `ℕ`; beware truncated `ℕ` subtraction/division). Pick a CamelCase
-   module name, e.g. `SqrtTwoIrrational`.
-2. **Write the file** `/tmp/<Name>.lean` (in the code sandbox), readable by a human:
+Then write the proof while it installs. Check progress with
+`python3 /tmp/lean-skill/lean_check.py status` (prints `READY`, `IN PROGRESS: …` or
+`FAILED`). Don't poll in a tight loop: work on the proof, then check.
 
-   ```lean
-   import Mathlib
+## 1. Write the proof
 
-   /-!
-   # <Title>
+Restate the claim in one line of plain math. Pick exact types (`ℝ`, `ℤ`, `ℕ`;
+`ℕ` subtraction/division truncate). Pick a CamelCase name. Write `/tmp/<Name>.lean`
+so a human can read it:
 
-   **Statement.** <plain-language statement>
+```lean
+import Mathlib
 
-   **Proof sketch.** <3–6 lines; mirrors the formal steps below>
-   -/
+/-!
+# <Title>
 
-   /-- <plain-math docstring> -/
-   theorem <name> ... := by
-     -- <comment per key step>
-     ...
+**Statement.** <plain-language statement>
 
-   #print axioms <name>
-   ```
+**Proof sketch.** <3–6 lines; mirrors the formal steps below>
+-/
 
-   Use structured steps (`have`, `calc`, `obtain ⟨x, hx⟩ := …`, `induction … with`),
-   helper lemmas with docstrings for long proofs, and comments that match the sketch.
-   Prefer Mathlib lemmas over re-proving standard facts. Mathlib names change often —
-   if unsure, prefer robust tactics (`simp`, `omega`, `positivity`, `nlinarith`,
-   `norm_num`, `ring`, `linarith`) over guessed lemma names. Never leave search
-   tactics like `exact?`/`apply?` in the file.
-3. **Check it** (takes ~2–6 minutes; just wait):
+/-- <plain-math docstring> -/
+theorem <name> ... := by
+  -- <short comment per key step>
+  ...
+```
 
-   ```bash
-   python3 scripts/lean_check.py --token "$TOKEN" --name <Name> --file /tmp/<Name>.lean
-   ```
+Use structured steps (`have`, `calc`, `obtain ⟨x, hx⟩ := …`, `induction … with`),
+helper lemmas with docstrings for long proofs. Prefer robust tactics (`simp`,
+`omega`, `ring`, `linarith`, `nlinarith`, `positivity`, `norm_num`, `field_simp`,
+`aesop`, `decide`) and well-known Mathlib lemmas. Never leave `exact?`/`apply?` in the
+final file. Always `import Mathlib` (the sandbox has all of it).
 
-   (`scripts/` is this skill's folder; copy the script into the sandbox if needed.)
-   Set `TOKEN` from the project instructions in the same command, without echoing it.
-4. **Read the verdict.** First line is `LEAN-CHECK: PASS` or `LEAN-CHECK: FAIL`,
-   followed by the Lean messages (`Proofs/<Name>.lean:LINE:COL: error: …`).
-   On FAIL: fix exactly what the errors say (unknown identifier → use another lemma
-   name or prove it inline; unsolved goals → the message shows the remaining goal)
-   and go back to step 3. Up to ~8 attempts; change strategy if the same step keeps
-   failing.
-5. **Report** (only after PASS): the final Lean file in a ```lean block, the informal
-   proof in plain math, the axioms line, and the link the script prints
-   (`https://github.com/thnastev/lean-proofs/blob/main/Proofs/<Name>.lean`).
-   If you could not get it to pass, say so plainly, show the best attempt with the
-   remaining `sorry` clearly marked and the exact open goal — never call it proven.
+## 2. Check, fix, repeat
+
+```bash
+python3 /tmp/lean-skill/lean_check.py check /tmp/<Name>.lean
+```
+
+Last line is `LEAN-CHECK: PASS` or `LEAN-CHECK: FAIL`; above it are Lean's messages
+(`<Name>.lean:LINE:COL: error: …`) and the axioms of each declaration.
+On FAIL, fix exactly what Lean reports (unknown identifier → different lemma or
+prove it inline; unsolved goals → the message shows the remaining goal; a
+counterexample from `omega`/`decide` may mean the statement itself is false — then
+tell the user). Each check takes seconds, so iterate freely; tactic experiments in a
+scratch file are cheap (`/tmp/Scratch.lean` with `example … := by …`). Change
+strategy if the same step fails 3 times.
+
+## 3. Report (only after PASS)
+
+1. The final Lean file in a ```lean block.
+2. The informal proof in plain math (matching the formal steps).
+3. The verdict lines (`PASS` and the axioms list) as evidence.
+4. If `/mnt/user-data/outputs` exists, copy the file there so the user can download it.
+
+If you cannot get it to pass, say so plainly: show the best attempt with the open
+step marked `sorry`, the exact remaining goal, and never call it proven.
 
 ## Troubleshooting
 
-- `HTTP 401/403` or connection errors to `api.github.com`: the code sandbox has no
-  network access to GitHub, or the token expired. Tell the user in one line:
-  enable network access for `api.github.com` in Settings → Capabilities (code
-  execution), or regenerate the token.
-- `no verdict after …s`: GitHub Actions is slow or disabled; give the user the CI
-  link the script printed.
-- Workflow finished without a verdict: Lean/Mathlib setup failed on GitHub's side;
-  rerun once, then report the CI link.
+- `status` says FAILED with a network/HTTP error (403, "proxy", "connection"): the
+  sandbox can't download from GitHub. Tell the user, in one line, to allow these
+  domains in Settings → Capabilities (code execution network access):
+  `github.com`, `api.github.com`, `release-assets.githubusercontent.com`,
+  `objects.githubusercontent.com` (or allow all domains). Then rerun setup.
+- "No space left" / killed: the sandbox is too small; say so plainly.
+- `lean` killed or very slow on a big file: split it into smaller lemmas.
