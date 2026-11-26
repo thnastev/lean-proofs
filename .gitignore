@@ -1,2 +1,3 @@
 /.lake
 .verify_*.lean
+__pycache__/
