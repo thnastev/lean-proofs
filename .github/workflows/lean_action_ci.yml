@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # to post the verdict as a commit comment
 
 jobs:
   verify:
@@ -17,8 +17,26 @@ jobs:
       - uses: leanprover/lean-action@v1
       # Strict check: no errors, no sorry/admit, only standard axioms.
       - name: Strict proof check
+        id: verify
+        if: always()
         env:
           LEAN_PROJECT_PATH: ${{ github.workspace }}
         run: |
+          set -o pipefail
           files=$(git ls-files '*.lean' | grep -v '^lakefile')
-          .claude/skills/lean-proofs/scripts/verify.sh $files
+          .claude/skills/lean-proofs/scripts/verify.sh $files 2>&1 | tee report.txt
+      # Machine-readable verdict for the chat skill (first line: LEAN-CHECK: PASS|FAIL).
+      - name: Post verdict on commit
+        if: always() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.verify.outcome }}" = "success" ]; then s=PASS; else s=FAIL; fi
+          {
+            echo "LEAN-CHECK: $s"
+            echo
+            echo '```'
+            if [ -s report.txt ]; then head -c 60000 report.txt; else echo "(Lean setup/build failed before verification - see the Actions log)"; fi
+            echo '```'
+          } > body.md
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" -F body=@body.md
