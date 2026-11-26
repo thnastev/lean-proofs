@@ -1,0 +1,24 @@
+name: Verify proofs
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installs Lean, fetches the Mathlib cache, runs `lake build`.
+      - uses: leanprover/lean-action@v1
+      # Strict check: no errors, no sorry/admit, only standard axioms.
+      - name: Strict proof check
+        env:
+          LEAN_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          files=$(git ls-files '*.lean' | grep -v '^lakefile')
+          .claude/skills/lean-proofs/scripts/verify.sh $files

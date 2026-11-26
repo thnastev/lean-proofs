@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "lean-lsp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "lean-lsp-mcp"
+      ],
+      "env": {
+        "PATH": "/root/.elan/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
